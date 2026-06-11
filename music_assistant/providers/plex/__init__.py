@@ -89,6 +89,7 @@ from music_assistant.providers.plex.constants import (
     ERR_NO_LIBRARIES,
     ERR_TRACK_NOT_FOUND,
     FAKE_ARTIST_PREFIX,
+    LIBRARY_PAGE_SIZE,
     PLEX_PRODUCT,
 )
 from music_assistant.providers.plex.helpers import (
@@ -450,9 +451,13 @@ class PlexProvider(MusicProvider):
     _plex_library: PlexMusicSection = None
     _myplex_account: MyPlexAccount = None
     _baseurl: str
+    # per-sync memo of resolved track-artist names (ItemMapping if in the library, None
+    # if not) to avoid repeating the same DB lookup for compilation/featured artists
+    _artist_name_cache: dict[str, ItemMapping | None]
 
     async def handle_async_init(self) -> None:
         """Set up the music provider by connecting to the server."""
+        self._artist_name_cache = {}
         # silence loggers
         logging.getLogger("plexapi").setLevel(self.logger.level + 10)
         _, library_name = str(self.config.get_value(CONF_LIBRARY_ID)).split(" / ", 1)
@@ -556,6 +561,16 @@ class PlexProvider(MusicProvider):
             raise MediaNotFoundError(ERR_ITEM_NOT_FOUND.format(item_id=key)) from err
         return cast("PlexObjectT", results)
 
+    @staticmethod
+    def _disable_reload(item: PlexObject) -> None:
+        """
+        Turn off plexapi's lazy reload for a partial (listing/search) item.
+
+        Reading an unset attribute on such an item would otherwise trigger a synchronous
+        network reload mid-parse, blocking the event loop for a whole HTTP round-trip.
+        """
+        item._autoReload = False
+
     def _get_item_mapping(self, media_type: MediaType, key: str, name: str) -> ItemMapping:
         """Get item mapping for a given media type, key, and name."""
         if not name:
@@ -588,11 +603,20 @@ class PlexProvider(MusicProvider):
         )
 
     async def _get_or_create_artist_by_name(self, artist_name: str) -> Artist | ItemMapping:
-        if library_items := await self.mass.music.artists.get_library_items_by_query(
+        if artist_name in self._artist_name_cache:
+            # reuse the cached library lookup; a miss (None) falls through to a fake artist
+            if (mapping := self._artist_name_cache[artist_name]) is not None:
+                return mapping
+        elif library_items := await self.mass.music.artists.get_library_items_by_query(
             search=artist_name, provider_filter=[self.instance_id]
         ):
-            return ItemMapping.from_item(library_items[0])
+            mapping = ItemMapping.from_item(library_items[0])
+            self._artist_name_cache[artist_name] = mapping
+            return mapping
+        else:
+            self._artist_name_cache[artist_name] = None
 
+        # not in the library: represent it as a fake artist (id is derived from the name)
         artist_id = FAKE_ARTIST_PREFIX + artist_name
         return Artist(
             item_id=artist_id,
@@ -662,6 +686,7 @@ class PlexProvider(MusicProvider):
 
     async def _parse_album(self, plex_album: PlexAlbum) -> Album:
         """Parse a Plex Album response to an Album model object."""
+        self._disable_reload(plex_album)
         album_id = plex_album.key
         album = Album(
             item_id=album_id,
@@ -676,10 +701,12 @@ class PlexProvider(MusicProvider):
                 )
             },
         )
-        # Check if album rating meets the configured threshold for favorites
+        # Mark as favorite when the Plex user rating meets the configured threshold.
+        # We only ever set it to True so a resync never clears a favorite that was
+        # set elsewhere in Music Assistant.
         favorite_threshold = cast("float", self.config.get_value(CONF_PLEX_FAVORITE_THRESHOLD))
-        if (favorite := get_favorite_from_rating(plex_album, favorite_threshold)) is not None:
-            album.favorite = favorite
+        if get_favorite_from_rating(plex_album, favorite_threshold):
+            album.favorite = True
 
         if plex_album.year:
             album.year = plex_album.year
@@ -699,6 +726,7 @@ class PlexProvider(MusicProvider):
 
     async def _parse_artist(self, plex_artist: PlexArtist) -> Artist:
         """Parse a Plex Artist response to Artist model object."""
+        self._disable_reload(plex_artist)
         artist_id = plex_artist.key
         if not artist_id:
             raise InvalidDataError(ERR_ARTIST_INVALID_ID)
@@ -723,6 +751,7 @@ class PlexProvider(MusicProvider):
 
     async def _parse_playlist(self, plex_playlist: PlexPlaylist) -> Playlist:
         """Parse a Plex Playlist response to a Playlist object."""
+        self._disable_reload(plex_playlist)
         playlist = Playlist(
             item_id=plex_playlist.key,
             provider=self.instance_id,
@@ -738,13 +767,16 @@ class PlexProvider(MusicProvider):
         )
         if plex_playlist.summary:
             playlist.metadata.description = plex_playlist.summary
-        if images := get_thumbnail_images(plex_playlist, self.instance_id):
+        # A playlist's cover - whether the auto-generated mosaic or a manually uploaded
+        # poster - is exposed via "composite" (Playlist.thumb is just an alias for it).
+        if images := get_thumbnail_images(plex_playlist, self.instance_id, ("composite",)):
             playlist.metadata.images = images
         playlist.is_editable = not plex_playlist.smart
         return playlist
 
     async def _parse_collection(self, plex_collection: PlexCollection) -> Playlist:
         """Parse a Plex Collection response to a Playlist object."""
+        self._disable_reload(plex_collection)
         # Get the configured collection prefix
         collection_prefix = str(self.config.get_value(CONF_COLLECTION_PREFIX) or "")
 
@@ -772,6 +804,7 @@ class PlexProvider(MusicProvider):
 
     async def _parse_track(self, plex_track: PlexTrack) -> Track:
         """Parse a Plex Track response to a Track model object."""
+        self._disable_reload(plex_track)
         content = plex_track.media[0].container if plex_track.media else None
         track = Track(
             item_id=plex_track.key,
@@ -797,10 +830,12 @@ class PlexProvider(MusicProvider):
             disc_number=plex_track.parentIndex or 0,
             track_number=plex_track.trackNumber or 0,
         )
-        # Check if track rating meets the configured threshold for favorites
+        # Mark as favorite when the Plex user rating meets the configured threshold.
+        # We only ever set it to True so a resync never clears a favorite that was
+        # set elsewhere in Music Assistant.
         favorite_threshold = cast("float", self.config.get_value(CONF_PLEX_FAVORITE_THRESHOLD))
-        if (favorite := get_favorite_from_rating(plex_track, favorite_threshold)) is not None:
-            track.favorite = favorite
+        if get_favorite_from_rating(plex_track, favorite_threshold):
+            track.favorite = True
 
         if plex_track.originalTitle and plex_track.originalTitle != plex_track.grandparentTitle:
             # The artist of the track if different from the album's artist.
@@ -895,16 +930,52 @@ class PlexProvider(MusicProvider):
 
         return search_results
 
+    async def _iter_library_items(
+        self, search_method: Callable[..., list[PlexObjectT]]
+    ) -> AsyncGenerator[PlexObjectT, None]:
+        """
+        Yield items from a library search method one page at a time.
+
+        The next page is fetched in the background while the current one is being
+        processed, so Plex network latency overlaps with parsing/DB work. maxresults is
+        set to the page size so plexapi returns a single page per request instead of
+        iterating through to the end of the library on every call.
+        """
+
+        def fetch_page(offset: int) -> Coroutine[Any, Any, list[PlexObjectT]]:
+            return self._run_async(
+                search_method,
+                container_start=offset,
+                container_size=LIBRARY_PAGE_SIZE,
+                maxresults=LIBRARY_PAGE_SIZE,
+            )
+
+        offset = 0
+        next_page: Task[list[PlexObjectT]] | None = asyncio.create_task(fetch_page(offset))
+        try:
+            while next_page is not None:
+                batch = await next_page
+                offset += LIBRARY_PAGE_SIZE
+                # prefetch the next page (unless this one was short, i.e. the last)
+                next_page = (
+                    asyncio.create_task(fetch_page(offset))
+                    if len(batch) == LIBRARY_PAGE_SIZE
+                    else None
+                )
+                for item in batch:
+                    yield item
+        finally:
+            if next_page is not None:
+                next_page.cancel()
+
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
         """Retrieve all library artists from Plex Music."""
-        artists_obj = await self._run_async(self._plex_library.all)
-        for artist in artists_obj:
+        async for artist in self._iter_library_items(self._plex_library.searchArtists):
             yield await self._parse_artist(artist)
 
     async def get_library_albums(self) -> AsyncGenerator[Album, None]:
         """Retrieve all library albums from Plex Music."""
-        albums_obj = await self._run_async(self._plex_library.albums)
-        for album in albums_obj:
+        async for album in self._iter_library_items(self._plex_library.searchAlbums):
             yield await self._parse_album(album)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
@@ -921,23 +992,10 @@ class PlexProvider(MusicProvider):
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Retrieve library tracks from Plex Music."""
-        page_size = 500
-        offset = 0
-        while True:
-            batch = cast(
-                "list[PlexTrack]",
-                await self._run_async(
-                    self._plex_library.searchTracks,
-                    title=None,
-                    container_size=page_size,
-                    container_start=offset,
-                ),
-            )
-            if not batch:
-                break
-            for plex_track in batch:
-                yield await self._parse_track(plex_track)
-            offset += page_size
+        # start each full track sync with a fresh artist-name memo
+        self._artist_name_cache = {}
+        async for plex_track in self._iter_library_items(self._plex_library.searchTracks):
+            yield await self._parse_track(plex_track)
 
     @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_album(self, prov_album_id: str) -> Album:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING, cast
 
 import plexapi
@@ -20,6 +21,18 @@ if TYPE_CHECKING:
     from plexapi.base import PlexObject
 
     from music_assistant.mass import MusicAssistant
+
+# Metadata image paths (/thumb, /art, ...) carry a trailing version timestamp that
+# changes when the artwork is updated and disappears when it is removed, so a stored
+# versioned path goes stale (404). Stripping it yields a stable path that always
+# resolves to the item's current art. "composite" is deliberately excluded: that
+# endpoint is a generated mosaic addressed by timestamp and 404s without it.
+PLEX_IMAGE_VERSION_RE = re.compile(r"(/(?:thumb|art|poster|banner))/\d+$")
+
+
+def stable_image_path(path: str) -> str:
+    """Strip the version timestamp from a Plex image path so it survives metadata updates."""
+    return PLEX_IMAGE_VERSION_RE.sub(r"\1", path)
 
 
 def configure_plex_identity(client_id: str) -> None:
@@ -136,7 +149,7 @@ def get_thumbnail_images(
             [
                 MediaItemImage(
                     type=ImageType.THUMB,
-                    path=thumb,
+                    path=stable_image_path(thumb),
                     provider=provider_instance_id,
                     remotely_accessible=False,
                 )
@@ -145,16 +158,16 @@ def get_thumbnail_images(
     return None
 
 
-def get_favorite_from_rating(plex_media: PlexObject, threshold: float) -> bool | None:
+def get_favorite_from_rating(plex_media: PlexObject, threshold: float) -> bool:
     """
-    Derive favorite status from the user rating of a Plex object.
+    Return True when the Plex user rating (0.0-10.0) of the object meets the threshold.
 
-    Returns None if the object has no user rating.
+    Returns False when the object is unrated or rated below the threshold; callers
+    should only ever *set* the favorite flag on True so a resync never clears a
+    favorite that was set elsewhere in Music Assistant.
 
     :param plex_media: The Plex object to read the user rating from.
     :param threshold: Minimum rating (0.0-10.0) to consider the item a favorite.
     """
     rating = getattr(plex_media, "userRating", None)
-    if rating is None:
-        return None
-    return float(rating) >= threshold
+    return rating is not None and float(rating) >= threshold

@@ -8,6 +8,9 @@ from typing import Final
 # machine's name (e.g. in the plex.tv "authorized devices" list and during auth).
 PLEX_PRODUCT: Final = "Music Assistant"
 
+# Page size for paginating library item fetches, to bound peak memory during sync.
+LIBRARY_PAGE_SIZE: Final = 500
+
 CONF_ACTION_AUTH_MYPLEX = "auth_myplex"
 CONF_ACTION_AUTH_LOCAL = "auth_local"
 CONF_ACTION_CLEAR_AUTH = "auth"
