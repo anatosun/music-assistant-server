@@ -17,7 +17,13 @@ from libopensonic.errors import (
 )
 from libopensonic.media import PodcastChannel
 from music_assistant_models.config_entries import ConfigEntry
-from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType, StreamType
+from music_assistant_models.enums import (
+    ConfigEntryType,
+    ContentType,
+    ExternalID,
+    MediaType,
+    StreamType,
+)
 from music_assistant_models.errors import (
     ActionUnavailable,
     LoginFailed,
@@ -52,6 +58,7 @@ from music_assistant.constants import (
     UNKNOWN_ARTIST,
 )
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.external_ids import barcode_to_upc, is_valid_barcode
 from music_assistant.helpers.podcast_parsers import rank_episodes_by_date
 from music_assistant.models.music_provider import MusicProvider
 
@@ -554,6 +561,31 @@ class OpenSonicProvider(MusicProvider):
             raise MediaNotFoundError(msg) from e
 
         return parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
+
+    async def get_album_by_external_id(
+        self, external_id: str, external_id_type: ExternalID
+    ) -> Album | None:
+        """
+        Retrieve an album by barcode (UPC/EAN).
+
+        Subsonic has no barcode lookup, so the barcode is sent as a search query: a server
+        that resolves barcodes in search (such as octo-fiesta) answers with the album, others
+        find nothing. The caller checks the album against the release's title and artist.
+        """
+        if external_id_type != ExternalID.BARCODE or not is_valid_barcode(external_id):
+            return None
+        try:
+            answer = await self.conn.search3(
+                query=barcode_to_upc(external_id),
+                artist_count=0,
+                album_count=1,
+                song_count=0,
+            )
+        except ParameterError, DataNotFoundError:
+            return None
+        if not answer.album:
+            return None
+        return await self.get_album(answer.album[0].id)
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:

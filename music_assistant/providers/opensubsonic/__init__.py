@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 SUPPORTED_FEATURES = {
     ProviderFeature.LIBRARY_ARTISTS,
     ProviderFeature.LIBRARY_ALBUMS,
+    ProviderFeature.ALBUM_BY_EXTERNAL_ID,
     ProviderFeature.LIBRARY_TRACKS,
     ProviderFeature.LIBRARY_PLAYLISTS,
     ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
